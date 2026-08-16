@@ -4,6 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LANShare — send files without the internet</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 20px auto; padding: 0 16px; }
+  textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 12px; }
+  button { margin: 4px 2px; padding: 6px 14px; cursor: pointer; }
+  #copyOffer, #copyAnswer { background: #1a73e8; color: white; border: none; border-radius: 4px; }
+  progress { width: 100%; }
+  fieldset { margin-bottom: 12px; }
+  .err-box { background: #fff3cd; border: 1px solid #ffc107; padding: 8px; border-radius: 4px; font-size: 13px; display: none; margin-top: 8px; }
+</style>
 </head>
 <body>
 
@@ -27,27 +36,31 @@
 <fieldset id="createBox" hidden>
 <legend><b>Room code (give this to your peer)</b></legend>
 <p><small>Send this text to the other person any way you like &mdash; chat app, USB drive, QR scan, read it aloud. It only needs to reach them once.</small></p>
-<p><textarea id="offerOut" rows="4" cols="60" readonly placeholder="generating..."></textarea></p>
-<p><button id="copyOffer">Copy code</button></p>
+<p><textarea id="offerOut" rows="5" readonly placeholder="generating..." autocorrect="off" autocapitalize="none" spellcheck="false"></textarea></p>
+<p><button id="copyOffer">📋 Copy code</button> <span id="copyOfferStatus" style="color:green;font-size:13px"></span></p>
 
 <hr>
 
 <legend><b>Paste their reply code</b></legend>
-<p><textarea id="answerIn" rows="4" cols="60" placeholder="paste the code your peer sends back"></textarea></p>
+<p><small>⚠️ Poora code paste karo — it's long!</small></p>
+<p><textarea id="answerIn" rows="5" placeholder="paste the code your peer sends back" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea></p>
 <p><button id="btnFinishCreate">Connect</button></p>
+<div id="debugInfo" class="err-box"></div>
 </fieldset>
 
 <fieldset id="joinBox" hidden>
 <legend><b>Paste the room code you were given</b></legend>
-<p><textarea id="offerIn" rows="4" cols="60" placeholder="paste the room code here"></textarea></p>
+<p><small>⚠️ Poora code paste karo — it's long!</small></p>
+<p><textarea id="offerIn" rows="5" placeholder="paste the room code here" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea></p>
 <p><button id="btnMakeAnswer">Generate reply code</button></p>
+<div id="joinDebugInfo" class="err-box"></div>
 
 <div id="answerOutWrap" hidden>
 <hr>
 <legend><b>Your reply code (send this back)</b></legend>
-<p><small>Send this back to the room creator so they can finish connecting.</small></p>
-<p><textarea id="answerOut" rows="4" cols="60" readonly></textarea></p>
-<p><button id="copyAnswer">Copy code</button></p>
+<p><small>Tap <b>Copy code</b> and send this back to the room creator.</small></p>
+<p><textarea id="answerOut" rows="5" readonly autocorrect="off" autocapitalize="none" spellcheck="false"></textarea></p>
+<p><button id="copyAnswer">📋 Copy code</button> <span id="copyAnswerStatus" style="color:green;font-size:13px"></span></p>
 </div>
 </fieldset>
 
@@ -192,20 +205,66 @@
     $('offerOut').value = JSON.stringify(pc.localDescription);
   };
 
-  $('copyOffer').onclick = () => {
-    $('offerOut').select();
-    navigator.clipboard?.writeText($('offerOut').value);
-  };
+  // ---- Robust clipboard copy (works on HTTP + mobile) ----
+  async function copyToClipboard(text, btnEl, statusEl) {
+    let success = false;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); success = true; } catch(e) {}
+    }
+    if (!success) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(ta);
+        ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
+        success = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch(e) {}
+    }
+    if (success) {
+      const orig = btnEl.textContent;
+      btnEl.textContent = '✅ Copied!';
+      if (statusEl) statusEl.textContent = 'Copied!';
+      setTimeout(() => { btnEl.textContent = orig; if(statusEl) statusEl.textContent=''; }, 3000);
+    } else {
+      alert('Auto-copy failed. Please manually long-press the text box and select all, then copy.');
+    }
+  }
+
+  $('copyOffer').onclick = () => copyToClipboard($('offerOut').value, $('copyOffer'), $('copyOfferStatus'));
+
+  function safeParseJSON(val, debugEl) {
+    const t = val.trim();
+    if (!t) { showErr(debugEl, '⚠️ Kuch paste nahi hua.'); return null; }
+    try { const p = JSON.parse(t); if(debugEl) debugEl.style.display='none'; return p; }
+    catch(e) {
+      let hint = t.length < 50 ? ' Code bahut chhota lag raha hai — poora copy karo.' :
+                 !t.startsWith('{') ? ' Code { se shuru hona chahiye — kuch missing hai.' :
+                 !t.endsWith('}') ? ' Code } pe khatam hona chahiye — kuch missing hai.' :
+                 ' Dobara carefully copy-paste karo.';
+      showErr(debugEl, '❌ Invalid code.' + hint + ' (length: ' + t.length + ')');
+      return null;
+    }
+  }
+
+  function showErr(el, msg) {
+    if (!el) { alert(msg); return; }
+    el.style.display = 'block';
+    el.textContent = msg;
+  }
 
   $('btnFinishCreate').onclick = async () => {
     const val = $('answerIn').value.trim();
-    if (!val || !pc) return;
+    const dbg = $('debugInfo');
+    const parsed = safeParseJSON(val, dbg);
+    if (!parsed || !pc) return;
     try {
-      const answer = JSON.parse(val);
-      await pc.setRemoteDescription(answer);
+      await pc.setRemoteDescription(parsed);
       setConnStatus('connecting...');
+      dbg.style.display = 'none';
     } catch (err){
-      alert('That reply code looks invalid. Double-check it was copied in full.');
+      showErr(dbg, '❌ WebRTC error: ' + err.message + '. Sahi reply code paste karo.');
     }
   };
 
@@ -218,10 +277,9 @@
 
   $('btnMakeAnswer').onclick = async () => {
     const val = $('offerIn').value.trim();
-    if (!val) return;
-    let offer;
-    try { offer = JSON.parse(val); }
-    catch (err){ alert('That room code looks invalid. Double-check it was copied in full.'); return; }
+    const dbg = $('joinDebugInfo');
+    const offer = safeParseJSON(val, dbg);
+    if (!offer) return;
 
     pc = new RTCPeerConnection(rtcConfig);
     pc.ondatachannel = (e) => {
@@ -233,20 +291,21 @@
       if (['disconnected','failed','closed'].includes(pc.connectionState)) setConnStatus('disconnected');
     };
 
-    await pc.setRemoteDescription(offer);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await waitForIceGathering(pc);
-
-    $('answerOut').value = JSON.stringify(pc.localDescription);
-    $('answerOutWrap').hidden = false;
-    setConnStatus('connecting...');
+    try {
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitForIceGathering(pc);
+      $('answerOut').value = JSON.stringify(pc.localDescription);
+      $('answerOutWrap').hidden = false;
+      setConnStatus('connecting...');
+      dbg.style.display = 'none';
+    } catch(err) {
+      showErr(dbg, '❌ WebRTC error: ' + err.message + '. Room code galat ya expired ho sakta hai.');
+    }
   };
 
-  $('copyAnswer').onclick = () => {
-    $('answerOut').select();
-    navigator.clipboard?.writeText($('answerOut').value);
-  };
+  $('copyAnswer').onclick = () => copyToClipboard($('answerOut').value, $('copyAnswer'), $('copyAnswerStatus'));
 
   // ---- Sending files ----
   btnSend.onclick = async () => {
