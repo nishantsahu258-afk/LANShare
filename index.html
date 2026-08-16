@@ -257,14 +257,26 @@
   $('btnFinishCreate').onclick = async () => {
     const val = $('answerIn').value.trim();
     const dbg = $('debugInfo');
+    const btn = $('btnFinishCreate');
     const parsed = safeParseJSON(val, dbg);
     if (!parsed || !pc) return;
+
+    // Already connected or already set — don't call again
+    if (pc.signalingState === 'stable') {
+      showErr(dbg, '⚠️ Already connected (ya Connect button pehle hi click ho chuka hai). Status dekho upar.');
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
     try {
       await pc.setRemoteDescription(parsed);
       setConnStatus('connecting...');
       dbg.style.display = 'none';
     } catch (err){
-      showErr(dbg, '❌ WebRTC error: ' + err.message + '. Sahi reply code paste karo.');
+      showErr(dbg, '❌ WebRTC error: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = 'Connect';
     }
   };
 
