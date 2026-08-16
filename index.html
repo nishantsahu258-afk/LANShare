@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LANShare — send files without the internet</title>
+</head>
+<body>
+
+<h1>LANShare</h1>
+<p>Send files straight between two browsers on the same network &mdash; no server, no upload, no internet required once connected.</p>
+
+<hr>
+
+<fieldset>
+<legend><b>1. Choose a role</b></legend>
+<p>One person creates a room, the other joins it. Both must be on the same Wi-Fi / LAN.</p>
+<p>
+<button id="btnCreate">Create room</button>
+<button id="btnJoin">Join a room</button>
+&nbsp;&nbsp;role: <b id="roleStatus">none chosen</b>
+</p>
+</fieldset>
+
+<br>
+
+<fieldset id="createBox" hidden>
+<legend><b>Room code (give this to your peer)</b></legend>
+<p><small>Send this text to the other person any way you like &mdash; chat app, USB drive, QR scan, read it aloud. It only needs to reach them once.</small></p>
+<p><textarea id="offerOut" rows="4" cols="60" readonly placeholder="generating..."></textarea></p>
+<p><button id="copyOffer">Copy code</button></p>
+
+<hr>
+
+<legend><b>Paste their reply code</b></legend>
+<p><textarea id="answerIn" rows="4" cols="60" placeholder="paste the code your peer sends back"></textarea></p>
+<p><button id="btnFinishCreate">Connect</button></p>
+</fieldset>
+
+<fieldset id="joinBox" hidden>
+<legend><b>Paste the room code you were given</b></legend>
+<p><textarea id="offerIn" rows="4" cols="60" placeholder="paste the room code here"></textarea></p>
+<p><button id="btnMakeAnswer">Generate reply code</button></p>
+
+<div id="answerOutWrap" hidden>
+<hr>
+<legend><b>Your reply code (send this back)</b></legend>
+<p><small>Send this back to the room creator so they can finish connecting.</small></p>
+<p><textarea id="answerOut" rows="4" cols="60" readonly></textarea></p>
+<p><button id="copyAnswer">Copy code</button></p>
+</div>
+</fieldset>
+
+<br>
+
+<fieldset>
+<legend><b>2. Connection status</b></legend>
+<p>status: <b id="connStatus">not connected</b></p>
+</fieldset>
+
+<br>
+
+<fieldset>
+<legend><b>3. Send a file</b></legend>
+<p>
+<input type="file" id="fileInput" disabled>
+<button id="btnSend" disabled>Send</button>
+</p>
+<div id="sendProgressWrap" hidden>
+<p><small id="sendLabel"></small><br>
+<progress id="sendProgress" value="0" max="100"></progress></p>
+</div>
+</fieldset>
+
+<br>
+
+<fieldset>
+<legend><b>4. Received files</b></legend>
+<ul id="receivedList"><li><small>nothing yet</small></li></ul>
+<div id="recvProgressWrap" hidden>
+<p><small id="recvLabel"></small><br>
+<progress id="recvProgress" value="0" max="100"></progress></p>
+</div>
+</fieldset>
+
+<hr>
+<p><small>Runs entirely in your browser. Files are sent directly peer-to-peer over a WebRTC data channel and are never stored anywhere else.</small></p>
+
+<script>
+(() => {
+  const CHUNK_SIZE = 16 * 1024;
+  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+  let pc = null;
+  let channel = null;
+  let incoming = null; // { name, size, mime, chunks: [], received: 0 }
+
+  const $ = id => document.getElementById(id);
+  const roleStatus = $('roleStatus');
+  const connStatus = $('connStatus');
+  const fileInput = $('fileInput');
+  const btnSend = $('btnSend');
+
+  function setConnStatus(text){
+    connStatus.textContent = text;
+  }
+
+  function waitForIceGathering(peer){
+    return new Promise(resolve => {
+      if (peer.iceGatheringState === 'complete') return resolve();
+      function check(){
+        if (peer.iceGatheringState === 'complete'){
+          peer.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }
+      }
+      peer.addEventListener('icegatheringstatechange', check);
+      setTimeout(resolve, 4000);
+    });
+  }
+
+  function setupChannelEvents(ch){
+    ch.binaryType = 'arraybuffer';
+    ch.onopen = () => {
+      setConnStatus('connected — ready to send files');
+      fileInput.disabled = false;
+      btnSend.disabled = false;
+    };
+    ch.onclose = () => {
+      setConnStatus('disconnected');
+      fileInput.disabled = true;
+      btnSend.disabled = true;
+    };
+    ch.onmessage = handleMessage;
+  }
+
+  function handleMessage(e){
+    if (typeof e.data === 'string'){
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'meta'){
+        incoming = { name: msg.name, size: msg.size, mime: msg.mime || 'application/octet-stream', chunks: [], received: 0 };
+        $('recvProgressWrap').hidden = false;
+        $('recvLabel').textContent = 'receiving ' + msg.name + ' (0%)';
+        $('recvProgress').value = 0;
+      } else if (msg.type === 'done' && incoming){
+        const blob = new Blob(incoming.chunks, { type: incoming.mime });
+        const url = URL.createObjectURL(blob);
+        const list = $('receivedList');
+        if (list.children.length === 1 && list.children[0].textContent.includes('nothing yet')) list.innerHTML = '';
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = incoming.name;
+        a.textContent = incoming.name + ' (' + formatBytes(incoming.size) + ')';
+        li.appendChild(a);
+        list.appendChild(li);
+        $('recvProgressWrap').hidden = true;
+        incoming = null;
+      }
+    } else if (incoming){
+      incoming.chunks.push(e.data);
+      incoming.received += e.data.byteLength;
+      const pct = Math.min(100, Math.round((incoming.received / incoming.size) * 100));
+      $('recvLabel').textContent = 'receiving ' + incoming.name + ' (' + pct + '%)';
+      $('recvProgress').value = pct;
+    }
+  }
+
+  function formatBytes(n){
+    if (n < 1024) return n + ' B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    return (n/1024/1024).toFixed(1) + ' MB';
+  }
+
+  // ---- Create room (offerer) ----
+  $('btnCreate').onclick = async () => {
+    roleStatus.textContent = 'room creator';
+    $('createBox').hidden = false;
+    $('joinBox').hidden = true;
+
+    pc = new RTCPeerConnection(rtcConfig);
+    channel = pc.createDataChannel('file');
+    setupChannelEvents(channel);
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') setConnStatus('connected — ready to send files');
+      if (['disconnected','failed','closed'].includes(pc.connectionState)) setConnStatus('disconnected');
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGathering(pc);
+    $('offerOut').value = JSON.stringify(pc.localDescription);
+  };
+
+  $('copyOffer').onclick = () => {
+    $('offerOut').select();
+    navigator.clipboard?.writeText($('offerOut').value);
+  };
+
+  $('btnFinishCreate').onclick = async () => {
+    const val = $('answerIn').value.trim();
+    if (!val || !pc) return;
+    try {
+      const answer = JSON.parse(val);
+      await pc.setRemoteDescription(answer);
+      setConnStatus('connecting...');
+    } catch (err){
+      alert('That reply code looks invalid. Double-check it was copied in full.');
+    }
+  };
+
+  // ---- Join room (answerer) ----
+  $('btnJoin').onclick = () => {
+    roleStatus.textContent = 'joining';
+    $('joinBox').hidden = false;
+    $('createBox').hidden = true;
+  };
+
+  $('btnMakeAnswer').onclick = async () => {
+    const val = $('offerIn').value.trim();
+    if (!val) return;
+    let offer;
+    try { offer = JSON.parse(val); }
+    catch (err){ alert('That room code looks invalid. Double-check it was copied in full.'); return; }
+
+    pc = new RTCPeerConnection(rtcConfig);
+    pc.ondatachannel = (e) => {
+      channel = e.channel;
+      setupChannelEvents(channel);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') setConnStatus('connected — ready to send files');
+      if (['disconnected','failed','closed'].includes(pc.connectionState)) setConnStatus('disconnected');
+    };
+
+    await pc.setRemoteDescription(offer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitForIceGathering(pc);
+
+    $('answerOut').value = JSON.stringify(pc.localDescription);
+    $('answerOutWrap').hidden = false;
+    setConnStatus('connecting...');
+  };
+
+  $('copyAnswer').onclick = () => {
+    $('answerOut').select();
+    navigator.clipboard?.writeText($('answerOut').value);
+  };
+
+  // ---- Sending files ----
+  btnSend.onclick = async () => {
+    const file = fileInput.files[0];
+    if (!file || !channel || channel.readyState !== 'open') return;
+
+    btnSend.disabled = true;
+    $('sendProgressWrap').hidden = false;
+    $('sendLabel').textContent = 'sending ' + file.name + ' (0%)';
+    $('sendProgress').value = 0;
+
+    channel.send(JSON.stringify({ type: 'meta', name: file.name, size: file.size, mime: file.type }));
+
+    let offset = 0;
+    const reader = new FileReader();
+
+    function readSlice(o){
+      const slice = file.slice(o, o + CHUNK_SIZE);
+      reader.readAsArrayBuffer(slice);
+    }
+
+    reader.onload = async (e) => {
+      while (channel.bufferedAmount > 8 * CHUNK_SIZE) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      channel.send(e.target.result);
+      offset += e.target.result.byteLength;
+      const pct = Math.min(100, Math.round((offset / file.size) * 100));
+      $('sendLabel').textContent = 'sending ' + file.name + ' (' + pct + '%)';
+      $('sendProgress').value = pct;
+
+      if (offset < file.size){
+        readSlice(offset);
+      } else {
+        channel.send(JSON.stringify({ type: 'done' }));
+        $('sendLabel').textContent = 'sent ' + file.name;
+        btnSend.disabled = false;
+      }
+    };
+
+    readSlice(0);
+  };
+})();
+</script>
+
+</body>
+</html>
