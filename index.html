@@ -83,212 +83,424 @@
 </div>
 </fieldset>
 
+<br>
+
+<fieldset>
+<legend><b>&#x1F50D; Debug Log</b> <small>(for troubleshooting)</small></legend>
+<div id="debugBox"></div>
+<p><button id="btnClearLog">Clear log</button></p>
+</fieldset>
+
 <hr>
 <p><small>Runs entirely in your browser. Files are sent directly peer-to-peer over a WebRTC data channel and are never stored anywhere else.</small></p>
 
 <script>
 (() => {
+  // === CONSTANTS =============================================================
   const CHUNK_SIZE = 16 * 1024;
-  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-  let pc = null;
-  let channel = null;
-  let incoming = null; // { name, size, mime, chunks: [], received: 0 }
+  // Multiple STUN servers for better ICE candidate gathering.
+  // iceCandidatePoolSize pre-gathers candidates so the SDP already contains
+  // all reachable candidates when it is encoded for out-of-band signaling.
+  const rtcConfig = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+    ],
+    iceCandidatePoolSize: 10,
+  };
 
+  // Raised from 4000 to 8000 ms so slower mobile networks have time to gather.
+  const ICE_GATHER_TIMEOUT_MS = 8000;
+
+  // === STATE =================================================================
+  let pc       = null;   // RTCPeerConnection
+  let channel  = null;   // RTCDataChannel
+  let incoming = null;   // in-progress receive { name, size, mime, chunks[], received }
+
+  // === DOM ===================================================================
   const $ = id => document.getElementById(id);
   const roleStatus = $('roleStatus');
   const connStatus = $('connStatus');
-  const fileInput = $('fileInput');
-  const btnSend = $('btnSend');
+  const fileInput  = $('fileInput');
+  const btnSend    = $('btnSend');
+  const debugBox   = $('debugBox');
 
-  function setConnStatus(text){
-    connStatus.textContent = text;
+  // === DEBUG LOGGER ==========================================================
+  function dbg(msg, level) {
+    level = level || 'info';
+    var ts  = new Date().toISOString().slice(11, 23);
+    var cls = { info:'info', warn:'warn', error:'err', ok:'ok' }[level] || 'info';
+    var line = document.createElement('span');
+    line.className = cls;
+    line.textContent = '[' + ts + '] ' + msg + '\n';
+    debugBox.appendChild(line);
+    debugBox.scrollTop = debugBox.scrollHeight;
+    console.log('[LANShare][' + level.toUpperCase() + '] ' + msg);
   }
 
-  function waitForIceGathering(peer){
-    return new Promise(resolve => {
-      if (peer.iceGatheringState === 'complete') return resolve();
-      function check(){
-        if (peer.iceGatheringState === 'complete'){
-          peer.removeEventListener('icegatheringstatechange', check);
+  $('btnClearLog').onclick = function() { debugBox.innerHTML = ''; };
+
+  function setConnStatus(text) {
+    connStatus.textContent = text;
+    dbg('Status -> "' + text + '"', 'ok');
+  }
+
+  // === ICE GATHERING WAIT ====================================================
+  // Waits for iceGatheringState === 'complete' OR the timeout, whichever first.
+  function waitForIceGathering(peer) {
+    return new Promise(function(resolve) {
+      if (peer.iceGatheringState === 'complete') {
+        dbg('ICE gathering already complete', 'ok');
+        return resolve();
+      }
+      var resolved = false;
+      var timer = setTimeout(function() {
+        if (!resolved) {
+          resolved = true;
+          dbg('ICE gathering timed out after ' + ICE_GATHER_TIMEOUT_MS + ' ms — using candidates gathered so far', 'warn');
           resolve();
         }
-      }
-      peer.addEventListener('icegatheringstatechange', check);
-      setTimeout(resolve, 4000);
+      }, ICE_GATHER_TIMEOUT_MS);
+      peer.addEventListener('icegatheringstatechange', function handler() {
+        dbg('ICE gathering state -> ' + peer.iceGatheringState);
+        if (peer.iceGatheringState === 'complete' && !resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          peer.removeEventListener('icegatheringstatechange', handler);
+          dbg('ICE gathering complete', 'ok');
+          resolve();
+        }
+      });
     });
   }
 
-  function setupChannelEvents(ch){
+  // === PEER CONNECTION LISTENERS =============================================
+  // Attaches all four WebRTC state machine listeners plus ICE candidate logging.
+  // Previously only onconnectionstatechange was used, which masks ICE failures.
+  function attachPcListeners(peer, role) {
+    dbg('[' + role + '] PeerConnection created');
+
+    peer.onsignalingstatechange = function() {
+      dbg('[' + role + '] Signaling state -> ' + peer.signalingState);
+    };
+
+    peer.onicegatheringstatechange = function() {
+      dbg('[' + role + '] ICE gathering state -> ' + peer.iceGatheringState);
+    };
+
+    // iceConnectionState is the primary ICE health indicator.
+    // "failed" means ICE checks timed out — most often because the remote peer
+    // did not apply the answer in time during manual (out-of-band) signaling.
+    peer.oniceconnectionstatechange = function() {
+      var s = peer.iceConnectionState;
+      var lvl = (s === 'connected' || s === 'completed') ? 'ok'
+              : (s === 'failed'    || s === 'disconnected') ? 'error' : 'info';
+      dbg('[' + role + '] ICE connection state -> ' + s, lvl);
+      if (s === 'connected' || s === 'completed') {
+        setConnStatus('ICE connected — waiting for data channel...');
+      }
+      if (s === 'failed') {
+        dbg('[' + role + '] ICE FAILED. Possible causes:\n' +
+            '  1. Remote description not applied before ICE checks timed out (normal in manual signaling — just apply the reply code faster).\n' +
+            '  2. No matching ICE candidates (symmetric NAT or UDP blocked by firewall).\n' +
+            '  3. STUN server unreachable.', 'error');
+        // Attempt ICE restart on offerer side before giving up.
+        if (role === 'offerer' && peer.signalingState === 'stable') {
+          dbg('[' + role + '] Attempting ICE restart...', 'warn');
+          peer.restartIce();
+        }
+      }
+      if (s === 'disconnected') {
+        dbg('[' + role + '] ICE disconnected — connectivity check failed temporarily', 'warn');
+      }
+    };
+
+    peer.onconnectionstatechange = function() {
+      var s = peer.connectionState;
+      var lvl = s === 'connected' ? 'ok'
+              : (s === 'failed' || s === 'disconnected') ? 'error' : 'info';
+      dbg('[' + role + '] Connection state -> ' + s, lvl);
+      if (s === 'connected') {
+        setConnStatus('connected — ready to send files');
+        fileInput.disabled = false;
+        btnSend.disabled   = false;
+      }
+      // Only show "disconnected" for terminal states (failed/closed), not transient ones.
+      if (s === 'failed' || s === 'closed') {
+        setConnStatus('disconnected');
+        fileInput.disabled = true;
+        btnSend.disabled   = true;
+      }
+    };
+
+    peer.onicecandidate = function(e) {
+      if (e.candidate) {
+        dbg('[' + role + '] ICE candidate: ' + e.candidate.candidate.split(' ').slice(0,8).join(' ') + '...');
+      } else {
+        dbg('[' + role + '] ICE candidate gathering finished (null sentinel)');
+      }
+    };
+
+    peer.onicecandidateerror = function(e) {
+      dbg('[' + role + '] ICE candidate error: ' + e.errorText + ' (url: ' + e.url + ')', 'warn');
+    };
+  }
+
+  // === DATA CHANNEL EVENTS ===================================================
+  function setupChannelEvents(ch, role) {
     ch.binaryType = 'arraybuffer';
-    ch.onopen = () => {
+    ch.onopen = function() {
+      dbg('[' + role + '] DataChannel open', 'ok');
       setConnStatus('connected — ready to send files');
       fileInput.disabled = false;
-      btnSend.disabled = false;
+      btnSend.disabled   = false;
     };
-    ch.onclose = () => {
+    ch.onclose = function() {
+      dbg('[' + role + '] DataChannel closed', 'warn');
       setConnStatus('disconnected');
       fileInput.disabled = true;
-      btnSend.disabled = true;
+      btnSend.disabled   = true;
+    };
+    ch.onerror = function(e) {
+      dbg('[' + role + '] DataChannel error: ' + (e.message || JSON.stringify(e)), 'error');
     };
     ch.onmessage = handleMessage;
   }
 
-  function handleMessage(e){
-    if (typeof e.data === 'string'){
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'meta'){
+  // === FILE RECEIVE HANDLER ==================================================
+  function handleMessage(e) {
+    if (typeof e.data === 'string') {
+      var msg = JSON.parse(e.data);
+      if (msg.type === 'meta') {
         incoming = { name: msg.name, size: msg.size, mime: msg.mime || 'application/octet-stream', chunks: [], received: 0 };
         $('recvProgressWrap').hidden = false;
         $('recvLabel').textContent = 'receiving ' + msg.name + ' (0%)';
         $('recvProgress').value = 0;
-      } else if (msg.type === 'done' && incoming){
-        const blob = new Blob(incoming.chunks, { type: incoming.mime });
-        const url = URL.createObjectURL(blob);
-        const list = $('receivedList');
+        dbg('Receiving file: ' + msg.name + ' (' + formatBytes(msg.size) + ')');
+      } else if (msg.type === 'done' && incoming) {
+        var blob = new Blob(incoming.chunks, { type: incoming.mime });
+        var url  = URL.createObjectURL(blob);
+        var list = $('receivedList');
         if (list.children.length === 1 && list.children[0].textContent.includes('nothing yet')) list.innerHTML = '';
-        const li = document.createElement('li');
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = incoming.name;
+        var li = document.createElement('li');
+        var a  = document.createElement('a');
+        a.href = url; a.download = incoming.name;
         a.textContent = incoming.name + ' (' + formatBytes(incoming.size) + ')';
         li.appendChild(a);
         list.appendChild(li);
         $('recvProgressWrap').hidden = true;
+        dbg('File received: ' + incoming.name, 'ok');
         incoming = null;
       }
-    } else if (incoming){
+    } else if (incoming) {
       incoming.chunks.push(e.data);
       incoming.received += e.data.byteLength;
-      const pct = Math.min(100, Math.round((incoming.received / incoming.size) * 100));
+      var pct = Math.min(100, Math.round((incoming.received / incoming.size) * 100));
       $('recvLabel').textContent = 'receiving ' + incoming.name + ' (' + pct + '%)';
       $('recvProgress').value = pct;
     }
   }
 
-  function formatBytes(n){
-    if (n < 1024) return n + ' B';
-    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
-    return (n/1024/1024).toFixed(1) + ' MB';
+  function formatBytes(n) {
+    if (n < 1024)        return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
   }
 
-  // ---- Create room (offerer) ----
-  $('btnCreate').onclick = async () => {
+  // === CREATE ROOM (OFFERER) =================================================
+  $('btnCreate').onclick = async function() {
     roleStatus.textContent = 'room creator';
     $('createBox').hidden = false;
-    $('joinBox').hidden = true;
+    $('joinBox').hidden   = true;
+    dbg('=== CREATE ROOM: starting ===');
 
-    pc = new RTCPeerConnection(rtcConfig);
+    // Close any previous connection cleanly before creating a new one.
+    if (pc) { pc.close(); dbg('Closed previous PeerConnection'); }
+
+    pc      = new RTCPeerConnection(rtcConfig);
     channel = pc.createDataChannel('file');
-    setupChannelEvents(channel);
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') setConnStatus('connected — ready to send files');
-      if (['disconnected','failed','closed'].includes(pc.connectionState)) setConnStatus('disconnected');
-    };
+    attachPcListeners(pc, 'offerer');
+    setupChannelEvents(channel, 'offerer');
 
-    const offer = await pc.createOffer();
+    dbg('Creating offer...');
+    var offer = await pc.createOffer();
+    dbg('Offer SDP created (' + offer.sdp.length + ' chars)');
+
     await pc.setLocalDescription(offer);
+    dbg('Local description set — signaling state: ' + pc.signalingState);
+
+    dbg('Waiting up to ' + ICE_GATHER_TIMEOUT_MS + ' ms for ICE candidates...');
     await waitForIceGathering(pc);
-    $('offerOut').value = JSON.stringify(pc.localDescription);
+
+    var encoded = JSON.stringify(pc.localDescription);
+    $('offerOut').value = encoded;
+    dbg('Room code ready — ' + encoded.length + ' chars. Copy and send to joiner.', 'ok');
   };
 
-  $('copyOffer').onclick = () => {
+  $('copyOffer').onclick = function() {
     $('offerOut').select();
-    navigator.clipboard?.writeText($('offerOut').value);
-  };
-
-  $('btnFinishCreate').onclick = async () => {
-    const val = $('answerIn').value.trim();
-    if (!val || !pc) return;
-    try {
-      const answer = JSON.parse(val);
-      await pc.setRemoteDescription(answer);
-      setConnStatus('connecting...');
-    } catch (err){
-      alert('That reply code looks invalid. Double-check it was copied in full.');
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText($('offerOut').value)
+        .then(function() { dbg('Room code copied to clipboard', 'ok'); })
+        .catch(function() { dbg('Clipboard write failed — select text manually', 'warn'); });
     }
   };
 
-  // ---- Join room (answerer) ----
-  $('btnJoin').onclick = () => {
-    roleStatus.textContent = 'joining';
-    $('joinBox').hidden = false;
-    $('createBox').hidden = true;
+  $('btnFinishCreate').onclick = async function() {
+    var val = $('answerIn').value.trim();
+    if (!val) { dbg('No reply code pasted yet', 'warn'); return; }
+    if (!pc)  { dbg('No PeerConnection — click "Create room" first', 'error'); return; }
+
+    dbg('=== FINISH CREATE: applying reply code (' + val.length + ' chars) ===');
+    dbg('Current signaling state: ' + pc.signalingState);
+    dbg('Current ICE state: ' + pc.iceConnectionState);
+
+    var answer;
+    try { answer = JSON.parse(val); }
+    catch(e) {
+      alert('That reply code looks invalid — make sure it was copied in full.');
+      dbg('JSON parse error on reply code', 'error');
+      return;
+    }
+
+    // Guard: setRemoteDescription(answer) is only valid in "have-local-offer" state.
+    if (pc.signalingState !== 'have-local-offer') {
+      var msg = 'Cannot apply answer in signaling state "' + pc.signalingState + '" — expected "have-local-offer". Try creating the room again.';
+      dbg(msg, 'error');
+      alert(msg);
+      return;
+    }
+
+    try {
+      await pc.setRemoteDescription(answer);
+      dbg('Remote description set — signaling state now: ' + pc.signalingState, 'ok');
+      setConnStatus('connecting...');
+    } catch(err) {
+      dbg('setRemoteDescription failed: ' + err.message, 'error');
+      alert('That reply code looks invalid. Double-check it was copied in full.\n\n' + err.message);
+    }
   };
 
-  $('btnMakeAnswer').onclick = async () => {
-    const val = $('offerIn').value.trim();
-    if (!val) return;
-    let offer;
+  // === JOIN ROOM (ANSWERER) ==================================================
+  $('btnJoin').onclick = function() {
+    roleStatus.textContent = 'joining';
+    $('joinBox').hidden   = false;
+    $('createBox').hidden = true;
+    dbg('=== JOIN ROOM: role selected ===');
+  };
+
+  $('btnMakeAnswer').onclick = async function() {
+    var val = $('offerIn').value.trim();
+    if (!val) { dbg('No room code pasted yet', 'warn'); return; }
+
+    dbg('=== MAKE ANSWER: processing room code (' + val.length + ' chars) ===');
+
+    var offer;
     try { offer = JSON.parse(val); }
-    catch (err){ alert('That room code looks invalid. Double-check it was copied in full.'); return; }
+    catch(e) {
+      alert('That room code looks invalid. Double-check it was copied in full.');
+      dbg('JSON parse error on room code', 'error');
+      return;
+    }
+
+    // Close any previous connection cleanly.
+    if (pc) { pc.close(); dbg('Closed previous PeerConnection'); }
 
     pc = new RTCPeerConnection(rtcConfig);
-    pc.ondatachannel = (e) => {
+    attachPcListeners(pc, 'answerer');
+
+    // ondatachannel must be set BEFORE setRemoteDescription so the event is not missed.
+    pc.ondatachannel = function(e) {
+      dbg('ondatachannel fired — data channel received from offerer', 'ok');
       channel = e.channel;
-      setupChannelEvents(channel);
-    };
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') setConnStatus('connected — ready to send files');
-      if (['disconnected','failed','closed'].includes(pc.connectionState)) setConnStatus('disconnected');
+      setupChannelEvents(channel, 'answerer');
     };
 
+    dbg('Setting remote description (offer)...');
     await pc.setRemoteDescription(offer);
-    const answer = await pc.createAnswer();
+    dbg('Remote description set — signaling state: ' + pc.signalingState);
+
+    dbg('Creating answer...');
+    var answer = await pc.createAnswer();
+    dbg('Answer SDP created (' + answer.sdp.length + ' chars)');
+
     await pc.setLocalDescription(answer);
+    dbg('Local description set — signaling state: ' + pc.signalingState);
+
+    dbg('Waiting up to ' + ICE_GATHER_TIMEOUT_MS + ' ms for ICE candidates...');
     await waitForIceGathering(pc);
 
-    $('answerOut').value = JSON.stringify(pc.localDescription);
+    var encoded = JSON.stringify(pc.localDescription);
+    $('answerOut').value = encoded;
     $('answerOutWrap').hidden = false;
-    setConnStatus('connecting...');
+
+    // KEY FIX: Do NOT say "connecting" here. ICE checks CANNOT succeed until the
+    // offerer applies this answer. Showing "connecting" would then flip to
+    // "disconnected" (because ICE fails before the offerer has the answer), which
+    // is exactly the confusing behaviour the user reported.
+    setConnStatus('waiting for offerer to apply reply code...');
+    dbg('Reply code ready — ' + encoded.length + ' chars. Copy it and paste into the room creator page.', 'ok');
+    dbg('WARNING: The connection will NOT complete until the offerer pastes this reply code.', 'warn');
   };
 
-  $('copyAnswer').onclick = () => {
+  $('copyAnswer').onclick = function() {
     $('answerOut').select();
-    navigator.clipboard?.writeText($('answerOut').value);
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText($('answerOut').value)
+        .then(function() { dbg('Reply code copied to clipboard', 'ok'); })
+        .catch(function() { dbg('Clipboard write failed — select text manually', 'warn'); });
+    }
   };
 
-  // ---- Sending files ----
-  btnSend.onclick = async () => {
-    const file = fileInput.files[0];
-    if (!file || !channel || channel.readyState !== 'open') return;
+  // === SEND FILE =============================================================
+  btnSend.onclick = async function() {
+    var file = fileInput.files[0];
+    if (!file || !channel || channel.readyState !== 'open') {
+      dbg('Send aborted: no file or data channel not open', 'warn');
+      return;
+    }
 
     btnSend.disabled = true;
     $('sendProgressWrap').hidden = false;
-    $('sendLabel').textContent = 'sending ' + file.name + ' (0%)';
+    $('sendLabel').textContent  = 'sending ' + file.name + ' (0%)';
     $('sendProgress').value = 0;
+    dbg('Sending file: ' + file.name + ' (' + formatBytes(file.size) + ')');
 
     channel.send(JSON.stringify({ type: 'meta', name: file.name, size: file.size, mime: file.type }));
 
-    let offset = 0;
-    const reader = new FileReader();
+    var offset = 0;
+    var reader = new FileReader();
 
-    function readSlice(o){
-      const slice = file.slice(o, o + CHUNK_SIZE);
-      reader.readAsArrayBuffer(slice);
+    function readSlice(o) {
+      reader.readAsArrayBuffer(file.slice(o, o + CHUNK_SIZE));
     }
 
-    reader.onload = async (e) => {
+    reader.onload = async function(e) {
       while (channel.bufferedAmount > 8 * CHUNK_SIZE) {
-        await new Promise(r => setTimeout(r, 20));
+        await new Promise(function(r) { setTimeout(r, 20); });
       }
       channel.send(e.target.result);
       offset += e.target.result.byteLength;
-      const pct = Math.min(100, Math.round((offset / file.size) * 100));
+      var pct = Math.min(100, Math.round((offset / file.size) * 100));
       $('sendLabel').textContent = 'sending ' + file.name + ' (' + pct + '%)';
       $('sendProgress').value = pct;
 
-      if (offset < file.size){
+      if (offset < file.size) {
         readSlice(offset);
       } else {
         channel.send(JSON.stringify({ type: 'done' }));
         $('sendLabel').textContent = 'sent ' + file.name;
         btnSend.disabled = false;
+        dbg('File sent: ' + file.name, 'ok');
       }
     };
 
     readSlice(0);
   };
+
+  dbg('LANShare ready. Choose a role to start.');
 })();
 </script>
 
