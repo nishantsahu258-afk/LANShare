@@ -4,6 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LANShare — send files without the internet</title>
+<style>
+  body {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 1rem;
+  }
+  textarea {
+    max-width: 100%;
+    box-sizing: border-box;
+    width: 100%;
+  }
+</style>
 </head>
 <body>
 
@@ -27,26 +39,26 @@
 <fieldset id="createBox" hidden>
 <legend><b>Room code (give this to your peer)</b></legend>
 <p><small>Send this text to the other person any way you like &mdash; chat app, USB drive, QR scan, read it aloud. It only needs to reach them once.</small></p>
-<p><textarea id="offerOut" rows="4" cols="60" readonly placeholder="generating..."></textarea></p>
+<p><textarea id="offerOut" rows="4" readonly placeholder="generating..."></textarea></p>
 <p><button id="copyOffer">Copy code</button></p>
 
 <hr>
 
 <legend><b>Paste their reply code</b></legend>
-<p><textarea id="answerIn" rows="4" cols="60" placeholder="paste the code your peer sends back"></textarea></p>
+<p><textarea id="answerIn" rows="4" placeholder="paste the code your peer sends back"></textarea></p>
 <p><button id="btnFinishCreate">Connect</button></p>
 </fieldset>
 
 <fieldset id="joinBox" hidden>
 <legend><b>Paste the room code you were given</b></legend>
-<p><textarea id="offerIn" rows="4" cols="60" placeholder="paste the room code here"></textarea></p>
+<p><textarea id="offerIn" rows="4" placeholder="paste the room code here"></textarea></p>
 <p><button id="btnMakeAnswer">Generate reply code</button></p>
 
 <div id="answerOutWrap" hidden>
 <hr>
 <legend><b>Your reply code (send this back)</b></legend>
 <p><small>Send this back to the room creator so they can finish connecting.</small></p>
-<p><textarea id="answerOut" rows="4" cols="60" readonly></textarea></p>
+<p><textarea id="answerOut" rows="4" readonly></textarea></p>
 <p><button id="copyAnswer">Copy code</button></p>
 </div>
 </fieldset>
